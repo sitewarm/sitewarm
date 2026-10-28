@@ -66,6 +66,39 @@ func TestReadSitemapAcceptsOnly2xx(t *testing.T) {
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// cancelingBody cancels the context and fails the read, as a body does when
+// the run ends after the headers were received.
+type cancelingBody struct{ cancel context.CancelFunc }
+
+func (b cancelingBody) Read([]byte) (int, error) { b.cancel(); return 0, context.Canceled }
+func (b cancelingBody) Close() error             { return nil }
+
+// A cancel after the headers, during the body read, is deterministic here
+// (the other tests race the cancel against the headers): no warning, nothing
+// cached.
+func TestRobotsCancelDuringBodyReadIsNotAWarning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: cancelingBody{cancel}}, nil
+	})}
+	robots := Fetcher{Client: client, UserAgent: "test"}.NewRobots()
+	ok, err := robots.Allowed(ctx, "https://example.com/page")
+	if ok || err != context.Canceled {
+		t.Fatalf("Allowed = %v, %v; want false, context canceled", ok, err)
+	}
+	if w := robots.Warnings(); len(w) != 0 {
+		t.Fatalf("warnings %v", w)
+	}
+	if len(robots.hosts) != 0 {
+		t.Fatalf("host cached after a canceled read: %v", robots.hosts)
+	}
+}
+
 // User-agent lines in a row share one group, wherever our token sits among
 // them, and a comment may start a line or follow a directive.
 func TestParseRobotsConsecutiveAgentsShareTheGroup(t *testing.T) {
