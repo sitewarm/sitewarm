@@ -66,6 +66,27 @@ func TestReadSitemapAcceptsOnly2xx(t *testing.T) {
 	}
 }
 
+// User-agent lines in a row share one group, wherever our token sits among
+// them, and a comment may start a line or follow a directive.
+func TestParseRobotsConsecutiveAgentsShareTheGroup(t *testing.T) {
+	for _, body := range []string{
+		"User-agent: sitewarm\nUser-agent: other\nDisallow: /x\n",
+		"User-agent: other\nUser-agent: sitewarm\nDisallow: /x\n",
+		"# header\nUser-agent: sitewarm # ours\n# note: Allow: /x\nUser-agent: other\nDisallow: /x # no\n",
+	} {
+		rules := parseRobots([]byte(body), RobotsToken)
+		if len(rules) != 1 || rules[0].pattern != "/x" || rules[0].allow {
+			t.Errorf("%q: rules = %+v, want one Disallow /x", body, rules)
+		}
+	}
+	// A group that ends with a rule is closed: the next User-agent starts a
+	// new one.
+	rules := parseRobots([]byte("User-agent: other\nDisallow: /a\nUser-agent: sitewarm\nDisallow: /b\n"), RobotsToken)
+	if len(rules) != 1 || rules[0].pattern != "/b" {
+		t.Errorf("rules = %+v, want only Disallow /b", rules)
+	}
+}
+
 // Octets from 0x7F up are escaped, 0x80 and 0x7F included; 0x7E ("~") is not.
 func TestNormalizeEscapesRawOctets(t *testing.T) {
 	for in, want := range map[string]string{
