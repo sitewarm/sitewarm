@@ -278,6 +278,7 @@ Each entry in `results`:
 | `ttfb_first_ms`, `ttfb_final_ms`, `time_to_hit_ms` | milliseconds, `null` when not measured |
 | `cache_control`, `age`, `vary` | response headers |
 | `set_cookie` | whether the response had a `Set-Cookie` header (the value is never reported) |
+| `set_cookie_names` | the names of the cookies set, in header order: the text before the first `=` of each `Set-Cookie`, spaces and tabs trimmed. Values and attributes are never read into the report. A name that is not an RFC 6265 token, or is over 64 bytes, is left out (not cut); names are listed once (case-sensitive) and at most 10. Names are reported as sent, so treat them as sensitive if a cookie name embeds an identifier. Left out when there are none |
 | `indexability`, `indexability_detail` | see [Failing on `noindex`](#failing-on-noindex) |
 | `canonical` | the absolute URL in the first `<link rel="canonical">` of the page's `<head>`, resolved against the final URL, at most 2048 bytes; left out when the page has none or the value is not an http(s) URL |
 | `warmed` | `true` when the reported measurement came after the URL had already been requested once in this run, or the first response was already a `HIT`; `false` for a single request that was not a `HIT` |
