@@ -240,6 +240,11 @@ func TestRobotsWaiterTakesOverWhenTheLoadingLookupIsCanceled(t *testing.T) {
 		waiterErr <- err
 	}()
 	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-waiter:
+		t.Fatal("waiter answered before the loading lookup ended: it did not wait")
+	default:
+	}
 	cancelLeader()
 	if err := <-leaderDone; err != context.Canceled {
 		t.Fatalf("leader = %v, want context canceled", err)
@@ -249,6 +254,9 @@ func TestRobotsWaiterTakesOverWhenTheLoadingLookupIsCanceled(t *testing.T) {
 	}
 	if w := robots.Warnings(); len(w) != 0 {
 		t.Fatalf("warnings %v after a canceled load", w)
+	}
+	if n := hits.Load(); n != 2 {
+		t.Fatalf("%d requests, want 2 (the canceled one and the takeover)", n)
 	}
 }
 

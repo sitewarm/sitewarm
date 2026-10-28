@@ -83,15 +83,20 @@ func (r *Robots) Allowed(ctx context.Context, rawURL string) (bool, error) {
 		r.loading[key] = l
 		r.mu.Unlock()
 
-		h := r.load(ctx, u)
-
-		r.mu.Lock()
-		if h != nil {
-			r.hosts[key] = h
-		}
-		delete(r.loading, key)
-		r.mu.Unlock()
-		close(l.done)
+		var h *robotsHost
+		func() {
+			// Deferred so waiters are released even if the load panics.
+			defer func() {
+				r.mu.Lock()
+				if h != nil {
+					r.hosts[key] = h
+				}
+				delete(r.loading, key)
+				r.mu.Unlock()
+				close(l.done)
+			}()
+			h = r.load(ctx, u)
+		}()
 
 		if h == nil {
 			// Canceled or past the run deadline: says nothing about the host.
