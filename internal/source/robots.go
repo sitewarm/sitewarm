@@ -45,6 +45,7 @@ type robotsHost struct {
 type robotsRule struct {
 	allow   bool
 	pattern string
+	norm    string // pattern after normalizeEscapes; empty means not computed
 }
 
 // NewRobots returns a checker that fetches with f.
@@ -185,7 +186,7 @@ func parseRobots(data []byte, token string) []robotsRule {
 				continue
 			}
 			g := groups[len(groups)-1]
-			g.rules = append(g.rules, robotsRule{allow: key == "allow", pattern: value})
+			g.rules = append(g.rules, robotsRule{allow: key == "allow", pattern: value, norm: normalizeEscapes(value)})
 		}
 	}
 	collect := func(agent string) (rules []robotsRule, found bool) {
@@ -209,17 +210,27 @@ func parseRobots(data []byte, token string) []robotsRule {
 
 // allowed applies the longest matching rule; on a tie, allow wins. No
 // matching rule allows.
+//
+// A rule matches when its pattern as written matches the path as written (as
+// it always did), or when the two match after normalizeEscapes, which adds the
+// other spellings of the same path. Its length is that of the longer form that
+// matched, so a rule never ranks lower than it did before.
 func allowed(rules []robotsRule, path string) bool {
 	best, ok := -1, true
 	norm := normalizeEscapes(path)
 	for _, r := range rules {
-		pattern := normalizeEscapes(r.pattern)
-		// The pattern as written still matches as it always did; the
-		// normalised pair only adds the other spellings of the same path.
-		if !matchRobots(r.pattern, path) && !matchRobots(pattern, norm) {
+		n := -1
+		if matchRobots(r.pattern, path) {
+			n = len(r.pattern)
+		}
+		if pattern := r.normalized(); n < 0 || pattern != r.pattern {
+			if matchRobots(pattern, norm) {
+				n = max(n, len(pattern))
+			}
+		}
+		if n < 0 {
 			continue
 		}
-		n := len(pattern)
 		if n > best || (n == best && r.allow) {
 			best, ok = n, r.allow
 		}
@@ -227,18 +238,41 @@ func allowed(rules []robotsRule, path string) bool {
 	return ok
 }
 
+// normalized is the pattern in the spelling of normalizeEscapes.
+func (r robotsRule) normalized() string {
+	if r.norm != "" || r.pattern == "" {
+		return r.norm
+	}
+	return normalizeEscapes(r.pattern)
+}
+
 // normalizeEscapes gives paths and patterns one spelling (RFC 9309 §2.2.2):
-// an escaped unreserved octet (ALPHA DIGIT - . _ ~) is decoded, the hex digits
-// of every other escape are uppercased, and an octet outside ASCII is escaped.
+//   - an escaped unreserved octet (ALPHA DIGIT - . _ ~) is decoded;
+//   - the hex digits of every other escape are uppercased;
+//   - an octet that net/url writes escaped in a path (controls, space,
+//     non-ASCII and the characters in escapedInPath) is escaped;
+//   - a % that does not start an escape becomes %25, so it can never join the
+//     characters after it into one.
+//
 // Reserved octets such as %2F, %3F and %23 stay escaped, so /a%2Fb is not
-// /a/b. An escape that is not followed by two hex digits is left as written.
-// The operators * and $ are not touched.
+// /a/b, and the operators * and $ are not touched.
 func normalizeEscapes(s string) string {
 	const hex = "0123456789ABCDEF"
+	plain := true
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c == '%' || mustEscape(c) {
+			plain = false
+			break
+		}
+	}
+	if plain {
+		return s
+	}
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
+		switch {
+		case c == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]):
 			v := unhex(s[i+1])<<4 | unhex(s[i+2])
 			if isUnreserved(v) {
 				b.WriteByte(v)
@@ -248,17 +282,25 @@ func normalizeEscapes(s string) string {
 				b.WriteByte(hex[v&15])
 			}
 			i += 2
-			continue
-		}
-		if c >= 0x80 {
+		case c == '%':
+			b.WriteString("%25")
+		case mustEscape(c):
 			b.WriteByte('%')
 			b.WriteByte(hex[c>>4])
 			b.WriteByte(hex[c&15])
-			continue
+		default:
+			b.WriteByte(c)
 		}
-		b.WriteByte(c)
 	}
 	return b.String()
+}
+
+// escapedInPath are the printable ASCII octets that net/url escapes in a path
+// and that are not reserved.
+const escapedInPath = "\"<>\\^`{|}"
+
+func mustEscape(c byte) bool {
+	return c <= 0x20 || c >= 0x7F || strings.IndexByte(escapedInPath, c) >= 0
 }
 
 func isHex(c byte) bool {
