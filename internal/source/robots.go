@@ -30,8 +30,12 @@ type Robots struct {
 	f        Fetcher
 	mu       sync.Mutex
 	hosts    map[string]*robotsHost
+	loading  map[string]*robotsLoad // first loads in flight, one per host
 	warnings []string
 }
+
+// robotsLoad is closed when the first load of a host ends, stored or not.
+type robotsLoad struct{ done chan struct{} }
 
 type robotsHost struct {
 	rules       []robotsRule // nil allows everything
@@ -45,7 +49,7 @@ type robotsRule struct {
 
 // NewRobots returns a checker that fetches with f.
 func (f Fetcher) NewRobots() *Robots {
-	return &Robots{f: f, hosts: map[string]*robotsHost{}}
+	return &Robots{f: f, hosts: map[string]*robotsHost{}, loading: map[string]*robotsLoad{}}
 }
 
 // Allowed reports whether rawURL may be requested.
@@ -55,27 +59,45 @@ func (r *Robots) Allowed(ctx context.Context, rawURL string) (bool, error) {
 		return false, err
 	}
 	key := u.Scheme + "://" + u.Host
-	r.mu.Lock()
-	h, ok := r.hosts[key]
-	r.mu.Unlock()
-	if !ok {
-		h = r.load(ctx, u)
+	for {
+		r.mu.Lock()
+		if h, ok := r.hosts[key]; ok {
+			r.mu.Unlock()
+			if h.unavailable {
+				return false, nil
+			}
+			return allowed(h.rules, robotsPath(u)), nil
+		}
+		if l, busy := r.loading[key]; busy {
+			// Another lookup is fetching this host's robots.txt: wait for it
+			// instead of sending a second request.
+			r.mu.Unlock()
+			select {
+			case <-l.done:
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+			continue // stored, or the loader was canceled and this one loads
+		}
+		l := &robotsLoad{done: make(chan struct{})}
+		r.loading[key] = l
+		r.mu.Unlock()
+
+		h := r.load(ctx, u)
+
+		r.mu.Lock()
+		if h != nil {
+			r.hosts[key] = h
+		}
+		delete(r.loading, key)
+		r.mu.Unlock()
+		close(l.done)
+
 		if h == nil {
 			// Canceled or past the run deadline: says nothing about the host.
 			return false, ctx.Err()
 		}
-		r.mu.Lock()
-		if prev, dup := r.hosts[key]; dup {
-			h = prev
-		} else {
-			r.hosts[key] = h
-		}
-		r.mu.Unlock()
 	}
-	if h.unavailable {
-		return false, nil
-	}
-	return allowed(h.rules, robotsPath(u)), nil
 }
 
 // Warnings lists one message per host whose robots.txt was unavailable.

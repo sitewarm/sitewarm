@@ -98,48 +98,157 @@ func TestRobotsBodyCutShortSkipsTheHost(t *testing.T) {
 	}
 }
 
-// Two first lookups of one host that overlap both fetch robots.txt; they must
-// agree, and the next lookup must use the stored entry.
-func TestRobotsConcurrentFirstLookupsOfOneHostAgree(t *testing.T) {
-	var arrived atomic.Int32
-	release := make(chan struct{})
+// Lookups of one host that overlap share a single robots.txt request: one
+// request, one warning, and every caller gets the same answer.
+func overlappingLookups(t *testing.T, status int) (requests int, robots *Robots, allowed []bool) {
+	t.Helper()
+	const callers = 16
+	var hits atomic.Int32
+	gate := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if arrived.Add(1) == 2 {
-			close(release)
+		hits.Add(1)
+		<-gate
+		w.WriteHeader(status)
+		if status == http.StatusOK {
+			w.Write([]byte("User-agent: *\nDisallow: /private\n"))
 		}
-		select {
-		case <-release:
-		case <-time.After(3 * time.Second):
+	}))
+	defer srv.Close()
+	robots = Fetcher{Client: srv.Client(), UserAgent: "test"}.NewRobots()
+
+	var started, done sync.WaitGroup
+	allowed = make([]bool, callers)
+	errs := make([]error, callers)
+	for i := range callers {
+		started.Add(1)
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			started.Done()
+			allowed[i], errs[i] = robots.Allowed(context.Background(), srv.URL+"/private/x")
+		}()
+	}
+	started.Wait()
+	time.Sleep(100 * time.Millisecond) // let every caller reach the lookup while the request is held
+	close(gate)
+	done.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
 		}
-		w.Write([]byte("User-agent: sitewarm\nDisallow: /private\n"))
+	}
+	return int(hits.Load()), robots, allowed
+}
+
+func TestRobotsOverlappingLookupsShareOneRequestAndOneWarning(t *testing.T) {
+	requests, robots, allowed := overlappingLookups(t, http.StatusServiceUnavailable)
+	if requests != 1 {
+		t.Fatalf("%d robots.txt requests, want 1", requests)
+	}
+	if w := robots.Warnings(); len(w) != 1 {
+		t.Fatalf("%d warnings %v, want 1", len(w), w)
+	}
+	for i, ok := range allowed {
+		if ok {
+			t.Fatalf("caller %d allowed on a host whose robots.txt is unavailable", i)
+		}
+	}
+}
+
+func TestRobotsOverlappingLookupsAgreeOnTheRules(t *testing.T) {
+	requests, robots, allowed := overlappingLookups(t, http.StatusOK)
+	if requests != 1 {
+		t.Fatalf("%d robots.txt requests, want 1", requests)
+	}
+	for i, ok := range allowed {
+		if ok {
+			t.Fatalf("caller %d allowed /private/x, want disallowed", i)
+		}
+	}
+	if w := robots.Warnings(); len(w) != 0 {
+		t.Fatalf("warnings %v", w)
+	}
+}
+
+// A caller that gives up while another lookup is loading returns its own
+// context error and leaves the load running for the others.
+func TestRobotsWaiterCanceledWhileAnotherLookupLoads(t *testing.T) {
+	var hits atomic.Int32
+	gate := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		<-gate
+		w.Write([]byte("User-agent: *\nDisallow: /private\n"))
 	}))
 	defer srv.Close()
 	robots := Fetcher{Client: srv.Client(), UserAgent: "test"}.NewRobots()
 
-	var wg sync.WaitGroup
-	results := make([]bool, 2)
-	errs := make([]error, 2)
-	for i := range results {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i], errs[i] = robots.Allowed(context.Background(), srv.URL+"/private/x")
-		}()
+	leader := make(chan bool, 1)
+	go func() {
+		ok, _ := robots.Allowed(context.Background(), srv.URL+"/private/x")
+		leader <- ok
+	}()
+	for hits.Load() == 0 {
+		time.Sleep(time.Millisecond)
 	}
-	wg.Wait()
-	if n := arrived.Load(); n != 2 {
-		t.Fatalf("%d requests; the test needs both first lookups to fetch", n)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if ok, err := robots.Allowed(ctx, srv.URL+"/other"); ok || err != context.DeadlineExceeded {
+		t.Fatalf("waiter = %v, %v; want false, deadline exceeded", ok, err)
 	}
-	for i := range results {
-		if errs[i] != nil || results[i] {
-			t.Fatalf("lookup %d = %v, %v; want disallowed", i, results[i], errs[i])
-		}
+	close(gate)
+	if ok := <-leader; ok {
+		t.Fatal("leader allowed /private/x")
 	}
-	if ok, err := robots.Allowed(context.Background(), srv.URL+"/public"); err != nil || !ok {
+	if ok, err := robots.Allowed(context.Background(), srv.URL+"/other"); err != nil || !ok {
 		t.Fatalf("later lookup = %v, %v", ok, err)
 	}
-	if n := arrived.Load(); n != 2 {
-		t.Fatalf("%d requests after the later lookup, want it served from the stored entry", n)
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("%d requests, want 1", n)
+	}
+}
+
+// If the lookup that is loading is canceled, a waiter does not inherit the
+// cancellation: it loads robots.txt itself.
+func TestRobotsWaiterTakesOverWhenTheLoadingLookupIsCanceled(t *testing.T) {
+	var hits atomic.Int32
+	first := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			once.Do(func() { close(first) })
+			<-r.Context().Done() // the first request hangs until its caller gives up
+			return
+		}
+		w.Write([]byte("User-agent: *\nDisallow: /private\n"))
+	}))
+	defer srv.Close()
+	robots := Fetcher{Client: srv.Client(), UserAgent: "test"}.NewRobots()
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := robots.Allowed(leaderCtx, srv.URL+"/private/x")
+		leaderDone <- err
+	}()
+	<-first
+	waiter := make(chan bool, 1)
+	waiterErr := make(chan error, 1)
+	go func() {
+		ok, err := robots.Allowed(context.Background(), srv.URL+"/private/x")
+		waiter <- ok
+		waiterErr <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancelLeader()
+	if err := <-leaderDone; err != context.Canceled {
+		t.Fatalf("leader = %v, want context canceled", err)
+	}
+	if ok, err := <-waiter, <-waiterErr; err != nil || ok {
+		t.Fatalf("waiter = %v, %v; want it to load the rules and find /private/x disallowed", ok, err)
+	}
+	if w := robots.Warnings(); len(w) != 0 {
+		t.Fatalf("warnings %v after a canceled load", w)
 	}
 }
 
