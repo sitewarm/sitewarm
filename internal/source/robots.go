@@ -211,16 +211,73 @@ func parseRobots(data []byte, token string) []robotsRule {
 // matching rule allows.
 func allowed(rules []robotsRule, path string) bool {
 	best, ok := -1, true
+	norm := normalizeEscapes(path)
 	for _, r := range rules {
-		if !matchRobots(r.pattern, path) {
+		pattern := normalizeEscapes(r.pattern)
+		// The pattern as written still matches as it always did; the
+		// normalised pair only adds the other spellings of the same path.
+		if !matchRobots(r.pattern, path) && !matchRobots(pattern, norm) {
 			continue
 		}
-		n := len(r.pattern)
+		n := len(pattern)
 		if n > best || (n == best && r.allow) {
 			best, ok = n, r.allow
 		}
 	}
 	return ok
+}
+
+// normalizeEscapes gives paths and patterns one spelling (RFC 9309 §2.2.2):
+// an escaped unreserved octet (ALPHA DIGIT - . _ ~) is decoded, the hex digits
+// of every other escape are uppercased, and an octet outside ASCII is escaped.
+// Reserved octets such as %2F, %3F and %23 stay escaped, so /a%2Fb is not
+// /a/b. An escape that is not followed by two hex digits is left as written.
+// The operators * and $ are not touched.
+func normalizeEscapes(s string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
+			v := unhex(s[i+1])<<4 | unhex(s[i+2])
+			if isUnreserved(v) {
+				b.WriteByte(v)
+			} else {
+				b.WriteByte('%')
+				b.WriteByte(hex[v>>4])
+				b.WriteByte(hex[v&15])
+			}
+			i += 2
+			continue
+		}
+		if c >= 0x80 {
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&15])
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c >= 'a':
+		return c - 'a' + 10
+	case c >= 'A':
+		return c - 'A' + 10
+	}
+	return c - '0'
+}
+
+func isUnreserved(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+		c == '-' || c == '.' || c == '_' || c == '~'
 }
 
 // matchRobots matches a path against a pattern with the * and $ operators
