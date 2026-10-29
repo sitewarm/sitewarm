@@ -137,6 +137,28 @@ func TestCacheWithinTTLSkipsNetwork(t *testing.T) {
 	}
 }
 
+func TestFirstRunSeedsTheCache(t *testing.T) {
+	f := newFake(t, 200, `{"tag_name":"v1.1.0"}`)
+	c := cfg(t, f.srv.URL) // an empty, writable cache directory: a fresh install
+	path := filepath.Join(c.CacheDir, cacheSubdir, cacheName)
+	if _, err := os.Stat(path); err == nil {
+		t.Fatal("cache file exists before the first run")
+	}
+	if got := notice(t, c); !strings.Contains(got, "1.1.0 is available") {
+		t.Errorf("first run printed %q, want the notice", got)
+	}
+	if n := f.hits.Load(); n != 1 {
+		t.Errorf("first run made %d requests, want exactly 1", n)
+	}
+	if b, err := os.ReadFile(path); err != nil || !strings.Contains(string(b), "1.1.0") {
+		t.Errorf("first run did not seed the cache: %q, %v", b, err)
+	}
+	notice(t, c)
+	if n := f.hits.Load(); n != 1 {
+		t.Errorf("second run made a request: %d total, want 1", n)
+	}
+}
+
 func TestCacheExpiresAfterTTL(t *testing.T) {
 	f := newFake(t, 200, `{"tag_name":"v1.1.0"}`)
 	c := cfg(t, f.srv.URL)
