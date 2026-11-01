@@ -30,8 +30,12 @@ type Robots struct {
 	f        Fetcher
 	mu       sync.Mutex
 	hosts    map[string]*robotsHost
+	loading  map[string]*robotsLoad // first loads in flight, one per host
 	warnings []string
 }
+
+// robotsLoad is closed when the first load of a host ends, stored or not.
+type robotsLoad struct{ done chan struct{} }
 
 type robotsHost struct {
 	rules       []robotsRule // nil allows everything
@@ -41,11 +45,12 @@ type robotsHost struct {
 type robotsRule struct {
 	allow   bool
 	pattern string
+	norm    string // pattern after normalizeEscapes; empty means not computed
 }
 
 // NewRobots returns a checker that fetches with f.
 func (f Fetcher) NewRobots() *Robots {
-	return &Robots{f: f, hosts: map[string]*robotsHost{}}
+	return &Robots{f: f, hosts: map[string]*robotsHost{}, loading: map[string]*robotsLoad{}}
 }
 
 // Allowed reports whether rawURL may be requested.
@@ -55,27 +60,50 @@ func (r *Robots) Allowed(ctx context.Context, rawURL string) (bool, error) {
 		return false, err
 	}
 	key := u.Scheme + "://" + u.Host
-	r.mu.Lock()
-	h, ok := r.hosts[key]
-	r.mu.Unlock()
-	if !ok {
-		h = r.load(ctx, u)
+	for {
+		r.mu.Lock()
+		if h, ok := r.hosts[key]; ok {
+			r.mu.Unlock()
+			if h.unavailable {
+				return false, nil
+			}
+			return allowed(h.rules, robotsPath(u)), nil
+		}
+		if l, busy := r.loading[key]; busy {
+			// Another lookup is fetching this host's robots.txt: wait for it
+			// instead of sending a second request.
+			r.mu.Unlock()
+			select {
+			case <-l.done:
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+			continue // stored, or the loader was canceled and this one loads
+		}
+		l := &robotsLoad{done: make(chan struct{})}
+		r.loading[key] = l
+		r.mu.Unlock()
+
+		var h *robotsHost
+		func() {
+			// Deferred so waiters are released even if the load panics.
+			defer func() {
+				r.mu.Lock()
+				if h != nil {
+					r.hosts[key] = h
+				}
+				delete(r.loading, key)
+				r.mu.Unlock()
+				close(l.done)
+			}()
+			h = r.load(ctx, u)
+		}()
+
 		if h == nil {
 			// Canceled or past the run deadline: says nothing about the host.
 			return false, ctx.Err()
 		}
-		r.mu.Lock()
-		if prev, dup := r.hosts[key]; dup {
-			h = prev
-		} else {
-			r.hosts[key] = h
-		}
-		r.mu.Unlock()
 	}
-	if h.unavailable {
-		return false, nil
-	}
-	return allowed(h.rules, robotsPath(u)), nil
 }
 
 // Warnings lists one message per host whose robots.txt was unavailable.
@@ -158,7 +186,7 @@ func parseRobots(data []byte, token string) []robotsRule {
 				continue
 			}
 			g := groups[len(groups)-1]
-			g.rules = append(g.rules, robotsRule{allow: key == "allow", pattern: value})
+			g.rules = append(g.rules, robotsRule{allow: key == "allow", pattern: value, norm: normalizeEscapes(value)})
 		}
 	}
 	collect := func(agent string) (rules []robotsRule, found bool) {
@@ -182,18 +210,116 @@ func parseRobots(data []byte, token string) []robotsRule {
 
 // allowed applies the longest matching rule; on a tie, allow wins. No
 // matching rule allows.
+//
+// A rule matches when its pattern as written matches the path as written (as
+// it always did), or when the two match after normalizeEscapes, which adds the
+// other spellings of the same path. Its length is that of the longer form that
+// matched, so a rule never ranks lower than it did before.
 func allowed(rules []robotsRule, path string) bool {
 	best, ok := -1, true
+	norm := normalizeEscapes(path)
 	for _, r := range rules {
-		if !matchRobots(r.pattern, path) {
+		n := -1
+		if matchRobots(r.pattern, path) {
+			n = len(r.pattern)
+		}
+		if pattern := r.normalized(); n < 0 || pattern != r.pattern {
+			if matchRobots(pattern, norm) {
+				n = max(n, len(pattern))
+			}
+		}
+		if n < 0 {
 			continue
 		}
-		n := len(r.pattern)
 		if n > best || (n == best && r.allow) {
 			best, ok = n, r.allow
 		}
 	}
 	return ok
+}
+
+// normalized is the pattern in the spelling of normalizeEscapes.
+func (r robotsRule) normalized() string {
+	if r.norm != "" || r.pattern == "" {
+		return r.norm
+	}
+	return normalizeEscapes(r.pattern)
+}
+
+// normalizeEscapes gives paths and patterns one spelling (RFC 9309 §2.2.2):
+//   - an escaped unreserved octet (ALPHA DIGIT - . _ ~) is decoded;
+//   - the hex digits of every other escape are uppercased;
+//   - an octet that net/url writes escaped in a path (controls, space,
+//     non-ASCII and the characters in escapedInPath) is escaped;
+//   - a % that does not start an escape becomes %25, so it can never join the
+//     characters after it into one.
+//
+// Reserved octets such as %2F, %3F and %23 stay escaped, so /a%2Fb is not
+// /a/b, and the operators * and $ are not touched.
+func normalizeEscapes(s string) string {
+	const hex = "0123456789ABCDEF"
+	plain := true
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c == '%' || mustEscape(c) {
+			plain = false
+			break
+		}
+	}
+	if plain {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]):
+			v := unhex(s[i+1])<<4 | unhex(s[i+2])
+			if isUnreserved(v) {
+				b.WriteByte(v)
+			} else {
+				b.WriteByte('%')
+				b.WriteByte(hex[v>>4])
+				b.WriteByte(hex[v&15])
+			}
+			i += 2
+		case c == '%':
+			b.WriteString("%25")
+		case mustEscape(c):
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&15])
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// escapedInPath are the printable ASCII octets that net/url escapes in a path
+// and that are not reserved.
+const escapedInPath = "\"<>\\^`{|}"
+
+func mustEscape(c byte) bool {
+	return c <= 0x20 || c >= 0x7F || strings.IndexByte(escapedInPath, c) >= 0
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c >= 'a':
+		return c - 'a' + 10
+	case c >= 'A':
+		return c - 'A' + 10
+	}
+	return c - '0'
+}
+
+func isUnreserved(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+		c == '-' || c == '.' || c == '_' || c == '~'
 }
 
 // matchRobots matches a path against a pattern with the * and $ operators
