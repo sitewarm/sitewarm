@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -112,7 +113,10 @@ type Entry struct {
 	Vary         string          `json:"vary,omitempty"`
 	// SetCookie records only whether the header was present; its value is
 	// never reported.
-	SetCookie          bool               `json:"set_cookie"`
+	SetCookie bool `json:"set_cookie"`
+	// SetCookieNames lists the names of the cookies set, never their values or
+	// attributes: see cookieNames for the limits.
+	SetCookieNames     []string           `json:"set_cookie_names,omitempty"`
 	Indexability       probe.Indexability `json:"indexability,omitempty"`
 	IndexabilityDetail string             `json:"indexability_detail,omitempty"`
 	// Canonical is the absolute canonical URL of the final page, from
@@ -275,6 +279,7 @@ func entry(o verify.Outcome) Entry {
 		e.Age = h.Get("Age")
 		e.Vary = strings.Join(h.Values("Vary"), ", ")
 		e.SetCookie = len(h.Values("Set-Cookie")) > 0
+		e.SetCookieNames = cookieNames(h.Values("Set-Cookie"))
 	}
 	e.Indexability = last.Indexability
 	e.IndexabilityDetail = last.IndexabilityDetail
@@ -286,6 +291,47 @@ func entry(o verify.Outcome) Entry {
 		e.Warnings = append(e.Warnings, "indexability inconclusive: "+e.IndexabilityDetail)
 	}
 	return e
+}
+
+const (
+	maxCookieNames   = 10
+	maxCookieNameLen = 64
+)
+
+// cookieNames returns the names of the cookies in Set-Cookie header values, in
+// header order: the text before the first "=", trimmed of spaces and tabs.
+// Only the name is read; the value and the attributes are never kept. A header
+// without "=", or whose name is empty or not an RFC 6265 token, adds no name.
+// A name over maxCookieNameLen bytes is dropped, not truncated. Names are
+// de-duplicated (case-sensitive, first kept) and capped at maxCookieNames.
+func cookieNames(values []string) []string {
+	var names []string
+	for _, v := range values {
+		name, _, ok := strings.Cut(v, "=")
+		if !ok {
+			continue
+		}
+		name = strings.Trim(name, " \t")
+		if name == "" || len(name) > maxCookieNameLen || !isToken(name) || slices.Contains(names, name) {
+			continue
+		}
+		names = append(names, name)
+		if len(names) == maxCookieNames {
+			break
+		}
+	}
+	return names
+}
+
+// isToken reports whether s is an RFC 6265 token: visible ASCII without the
+// separators ()<>@,;:\"/[]?={}.
+func isToken(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c <= 0x20 || c >= 0x7f || strings.IndexByte(`()<>@,;:\"/[]?={}`, c) >= 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // WriteJSON writes the report as indented JSON.

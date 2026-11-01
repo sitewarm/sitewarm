@@ -11,6 +11,14 @@ the public API.
 
 ### Added
 
+- Each entry in the JSON report has an optional `set_cookie_names`: the names
+  of the cookies the response set (the text before the first `=` of each
+  `Set-Cookie` header), at most 10, each at most 64 bytes, once each, in
+  header order. Values and attributes are never read into the report. It is
+  left out when there are none; `set_cookie` keeps its meaning and the
+  existing fields are unchanged. In Go, `Result` entries have a
+  `SetCookieNames` slice.
+
 - `sitewarm scan` prints a one-line notice on stderr when a newer release
   exists. It is off in CI, when stderr is not a terminal and with
   `SITEWARM_NO_UPDATE_CHECK=1` or `--no-update-check`; it never installs
