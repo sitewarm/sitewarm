@@ -25,6 +25,35 @@
 > [`v0-python`](https://github.com/sitewarm/sitewarm/tree/v0-python).
 > See the [changelog](CHANGELOG.md).
 
+## Quickstart
+
+```
+curl -fsSL https://raw.githubusercontent.com/sitewarm/sitewarm/master/scripts/install.sh | sh
+sitewarm scan --from-sitemap https://example.com/sitemap.xml
+echo $?   # 0: every URL passed; 1: some result is in --fail-on
+```
+
+The first line installs into `~/.local/bin` (add it to your `PATH` if it is not
+there). See [Install](#install) for the other ways, and [Usage](#usage) for the
+flags.
+
+**On GitHub Actions?** Use the
+[sitewarm Action](https://github.com/marketplace/actions/sitewarm) (v1, on the
+GitHub Marketplace) instead of installing the CLI in a step. After each
+Production deploy it checks the CDN cache and the key pages and posts a GitHub
+Check with what changed:
+
+```yaml
+- uses: sitewarm/action@v1
+  with:
+    site-url: https://www.example.com
+    urls-file: .github/sitewarm-urls.csv
+```
+
+The first run saves a baseline; the comparison starts with the next Production
+deploy. The [Action README](https://github.com/sitewarm/action#readme) has the
+trigger, the CSV format and the inputs.
+
 ## Install
 
 On Linux or macOS, one line installs the latest stable release into
@@ -210,7 +239,9 @@ a second Ctrl-C exits at once.
 
 Run it after the deploy has finished and the site is live. The exit code is the
 result: a step that runs `sitewarm scan` fails when a result is in `--fail-on`
-(see [Exit codes](#exit-codes)).
+(see [Exit codes](#exit-codes)). On GitHub Actions, the
+[sitewarm Action](https://github.com/marketplace/actions/sitewarm) does this
+without install lines and posts a Check (see the [Quickstart](#quickstart)).
 
 Any shell step:
 
