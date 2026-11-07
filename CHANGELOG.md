@@ -7,6 +7,8 @@ the public API.
 
 ## [Unreleased]
 
+## [1.1.0-rc.1] - 2026-10-27
+
 ### Added
 
 - `sitewarm scan` prints a one-line notice on stderr when a newer release

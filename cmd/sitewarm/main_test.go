@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -177,6 +178,31 @@ func TestCookieWithoutCookieHostsFailsAtStart(t *testing.T) {
 	}
 	if code := run(context.Background(), []string{"scan", "--top-from", csvFor(t, srv.URL+"/")}, e); code != 2 {
 		t.Fatalf("exit %d, want 2; stderr: %s", code, h.stderr.String())
+	}
+}
+
+func TestOtherCommandsMakeNoUpdateRequest(t *testing.T) {
+	old := sitewarm.Version
+	sitewarm.Version = "1.0.0"
+	t.Cleanup(func() { sitewarm.Version = old })
+	var hits atomic.Int32
+	rel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Write([]byte(`{"tag_name":"v1.1.0"}`))
+	}))
+	defer rel.Close()
+
+	for _, args := range [][]string{{"--version"}, {"--help"}, {"help"}, {"scan", "--help"}, {"completion", "bash"}} {
+		h := newHarness()
+		e := h.env()
+		e.update = update.Config{URL: rel.URL, CacheDir: t.TempDir(), TTY: true}
+		run(context.Background(), args, e)
+		if strings.Contains(h.stderr.String(), "available") {
+			t.Errorf("%v: printed an update notice: %q", args, h.stderr.String())
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("update requests = %d, want 0 outside scan", n)
 	}
 }
 

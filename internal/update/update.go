@@ -34,7 +34,7 @@ const (
 type Config struct {
 	Current  string // running version, e.g. "1.0.2" or "dev"
 	URL      string // latest-release endpoint
-	CacheDir string // user cache dir; "" disables the cache
+	CacheDir string // user cache dir; "" or an unwritable one disables the check
 	Getenv   func(string) string
 	TTY      bool // stderr is a terminal
 	Disabled bool // --no-update-check
@@ -115,18 +115,22 @@ type cacheFile struct {
 // latest returns the newest known version: the cached one while it is
 // fresh, otherwise a new look-up. Every failure yields "" or the stale value.
 func latest(ctx context.Context, c Config) string {
-	path := ""
-	if c.CacheDir != "" {
-		path = filepath.Join(c.CacheDir, cacheSubdir, cacheName)
+	// Without a usable cache nothing could remember the answer or a failure,
+	// so every run would spend one of the 60 unauthenticated requests an hour.
+	if c.CacheDir == "" {
+		return ""
+	}
+	path := filepath.Join(c.CacheDir, cacheSubdir, cacheName)
+	if os.MkdirAll(filepath.Dir(path), 0o700) != nil {
+		return ""
 	}
 	var cached cacheFile
-	if path != "" {
-		if b, err := os.ReadFile(path); err == nil {
-			_ = json.Unmarshal(b, &cached)
-		}
-		if _, ok := parse(cached.Latest); ok && c.Now().Sub(cached.Checked) < ttl && !cached.Checked.After(c.Now()) {
-			return cached.Latest
-		}
+	if b, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(b, &cached)
+	}
+	// A cached failure has an empty Latest; it still counts as fresh.
+	if !cached.Checked.IsZero() && !cached.Checked.After(c.Now()) && c.Now().Sub(cached.Checked) < ttl {
+		return cached.Latest
 	}
 	got, err := fetch(ctx, c)
 	if err != nil {
@@ -134,9 +138,7 @@ func latest(ctx context.Context, c Config) string {
 		// retry on every run; keep the last good value.
 		got = cached.Latest
 	}
-	if path != "" {
-		writeCache(path, cacheFile{Checked: c.Now(), Latest: got})
-	}
+	writeCache(path, cacheFile{Checked: c.Now(), Latest: got})
 	return got
 }
 

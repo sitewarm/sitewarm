@@ -149,16 +149,45 @@ func TestCacheExpiresAfterTTL(t *testing.T) {
 }
 
 func TestOfflineIsSilentAndBacksOff(t *testing.T) {
-	f := newFake(t, 200, `{}`)
-	url := f.srv.URL
-	f.srv.Close()
-	c := cfg(t, url)
+	f := newFake(t, 500, `oops`)
+	c := cfg(t, f.srv.URL)
 	if got := notice(t, c); got != "" {
-		t.Errorf("offline run printed %q", got)
+		t.Errorf("failed run printed %q", got)
 	}
 	// The failure is cached too, so the next run does not retry within the TTL.
 	if got := notice(t, c); got != "" {
-		t.Errorf("second offline run printed %q", got)
+		t.Errorf("second failed run printed %q", got)
+	}
+	if n := f.hits.Load(); n != 1 {
+		t.Errorf("requests = %d, want 1 (the second run backs off)", n)
+	}
+	c.Now = func() time.Time { return t0.Add(25 * time.Hour) }
+	notice(t, c)
+	if n := f.hits.Load(); n != 2 {
+		t.Errorf("requests = %d, want 2 once the backoff has expired", n)
+	}
+}
+
+func TestNoUsableCacheMakesNoRequest(t *testing.T) {
+	f := newFake(t, 200, `{"tag_name":"v1.1.0"}`)
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, dir := range map[string]string{
+		"no cache dir":       "",
+		"uncreatable folder": filepath.Join(file, "sub"),
+	} {
+		c := cfg(t, f.srv.URL)
+		c.CacheDir = dir
+		for i := 0; i < 3; i++ {
+			if got := notice(t, c); got != "" {
+				t.Errorf("%s: unexpected notice %q", name, got)
+			}
+		}
+	}
+	if n := f.hits.Load(); n != 0 {
+		t.Errorf("requests = %d, want 0 without a usable cache", n)
 	}
 }
 

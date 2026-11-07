@@ -65,8 +65,10 @@ With Go 1.26 or newer you can install from source instead:
 go install github.com/sitewarm/sitewarm/cmd/sitewarm@latest
 ```
 
-A binary built this way reports its version as `dev`; the release archives
-report the release version.
+A binary built this way reports the module version it was built from (since
+1.0.2: `sitewarm --version` prints `1.0.2` after `@v1.0.2`), and the release
+archives report the release version. A build that carries no module version,
+such as one from an unreleased checkout, reports `dev`.
 
 ### Build from source
 
