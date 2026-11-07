@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <strong>Warm your top pages after a deploy, and prove the CDN serves them from cache.</strong><br/>
+  <strong>Warm your key pages after a deploy, and see per URL whether the CDN serves them from cache.</strong><br/>
   Per URL and browser profile, on Cloudflare, Vercel, CloudFront, Fastly and Akamai.
 </p>
 
